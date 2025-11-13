@@ -5,26 +5,27 @@ import httpx
 from fastmcp import FastMCP
 from openai import OpenAI
 
+
 # ---------- Конфигурация ----------
 
 MCP_SERVER_NAME = "qdrant_rag"
 
-# Переменные окружения
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-QDRANT_URL = os.getenv("QDRANT_URL")  # например: https://your-qdrant-url
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")  # API key/tокен
+QDRANT_URL = os.getenv("QDRANT_URL")            # пример: https://xxx.eu-central-1-0.aws.cloud.qdrant.io
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "docs")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 
-# Инициализация клиентов
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
 mcp = FastMCP(MCP_SERVER_NAME)
 
 
-# ---------- Вспомогательные функции ----------
+# ---------- Вспомогательные штуки ----------
 
 class ConfigError(Exception):
-    """Ошибка конфигурации MCP-сервера (нет env переменных и т.п.)."""
+    """Ошибка конфигурации MCP-сервера (нет env-переменных и т.п.)."""
+    pass
 
 
 def ensure_config() -> None:
@@ -40,12 +41,12 @@ def ensure_config() -> None:
     if missing:
         raise ConfigError(
             f"Missing env vars: {', '.join(missing)}. "
-            "Set them in Render.com → Environment."
+            f"Set them in Render Environment."
         )
 
 
-async def embed_text(text: str) -> List[float]:
-    """Делаем эмбеддинг текста через OpenAI Embeddings API."""
+def embed_text(text: str) -> List[float]:
+    """Синхронно получаем эмбеддинг текста через OpenAI Embeddings API."""
     if not openai_client:
         raise ConfigError("OPENAI_API_KEY is not set")
 
@@ -56,12 +57,12 @@ async def embed_text(text: str) -> List[float]:
     return resp.data[0].embedding
 
 
-async def qdrant_upsert(
+def qdrant_upsert(
     doc_id: str,
     vector: List[float],
     payload: Dict[str, Any],
 ) -> None:
-    """Upsert точки в Qdrant."""
+    """Создаём/обновляем точку в Qdrant."""
     ensure_config()
 
     headers = {
@@ -79,13 +80,16 @@ async def qdrant_upsert(
         ]
     }
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        url = f"{QDRANT_URL}/collections/{QDRANT_COLLECTION}/points"
-        resp = await client.put(url, headers=headers, json=body)
+    # Убедимся, что нет двойного слэша
+    base_url = QDRANT_URL.rstrip("/")
+
+    with httpx.Client(timeout=30.0) as client:
+        url = f"{base_url}/collections/{QDRANT_COLLECTION}/points"
+        resp = client.put(url, headers=headers, json=body)
         resp.raise_for_status()
 
 
-async def qdrant_search(
+def qdrant_search(
     query_vector: List[float],
     top_k: int = 5,
 ) -> List[Dict[str, Any]]:
@@ -104,9 +108,11 @@ async def qdrant_search(
         "with_vectors": False,
     }
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        url = f"{QDRANT_URL}/collections/{QDRANT_COLLECTION}/points/search"
-        resp = await client.post(url, headers=headers, json=body)
+    base_url = QDRANT_URL.rstrip("/")
+
+    with httpx.Client(timeout=30.0) as client:
+        url = f"{base_url}/collections/{QDRANT_COLLECTION}/points/search"
+        resp = client.post(url, headers=headers, json=body)
         resp.raise_for_status()
         data = resp.json()
         return data.get("result", [])
@@ -114,18 +120,19 @@ async def qdrant_search(
 
 # ---------- MCP tools ----------
 
-@mcp.tool
-async def ping() -> str:
+@mcp.tool()
+def ping() -> str:
     """
     Простой healthcheck MCP-сервера.
 
-    Возвращает строку "pong" если сервер жив.
+    Возвращает "pong", если сервер жив и конфигурация валидна.
     """
+    ensure_config()
     return "pong"
 
 
-@mcp.tool
-async def store_document(
+@mcp.tool()
+def store_document(
     doc_id: str,
     text: str,
     metadata: Optional[Dict[str, Any]] = None,
@@ -134,28 +141,28 @@ async def store_document(
     Сохранить текст документа в Qdrant с эмбеддингом.
 
     Args:
-        doc_id: Уникальный ID документа (строка).
+        doc_id: Уникальный ID документа.
         text: Содержимое документа.
-        metadata: Дополнительные метаданные (произвольный словарь).
+        metadata: Доп. метаданные (любой JSON-объект).
 
     Returns:
-        Строковое сообщение об успешной операции.
+        Статус-строка об успешной операции или ошибке.
     """
     try:
         ensure_config()
-        vector = await embed_text(text)
-        payload = {"text": text}
+        vector = embed_text(text)
+        payload: Dict[str, Any] = {"text": text}
         if metadata:
             payload["metadata"] = metadata
 
-        await qdrant_upsert(doc_id, vector, payload)
+        qdrant_upsert(doc_id, vector, payload)
         return f"Document {doc_id} stored successfully in collection '{QDRANT_COLLECTION}'."
     except Exception as e:
         return f"Error in store_document: {e!r}"
 
 
-@mcp.tool
-async def search_documents(
+@mcp.tool()
+def search_documents(
     query: str,
     top_k: int = 5,
 ) -> List[Dict[str, Any]]:
@@ -163,20 +170,26 @@ async def search_documents(
     Поиск по документам в Qdrant.
 
     Args:
-        query: Текст запроса пользователя.
+        query: Текстовый запрос пользователя.
         top_k: Количество результатов (по умолчанию 5).
 
     Returns:
-        Список найденных документов с полями:
-        - id
-        - score
-        - text
-        - metadata (если есть)
+        Список найденных документов:
+        [
+          {
+            "id": ...,
+            "score": ...,
+            "text": ...,
+            "metadata": {...}
+          },
+          ...
+        ]
+        либо один элемент с ключом "error" при ошибке.
     """
     try:
         ensure_config()
-        query_vector = await embed_text(query)
-        hits = await qdrant_search(query_vector, top_k=top_k)
+        query_vector = embed_text(query)
+        hits = qdrant_search(query_vector, top_k=top_k)
 
         results: List[Dict[str, Any]] = []
         for hit in hits:
@@ -191,15 +204,16 @@ async def search_documents(
             )
         return results
     except Exception as e:
-        # Ошибку отдаем как "один элемент списка" — LLM сам поймёт, что что-то пошло не так
         return [{"error": repr(e)}]
 
 
 # ---------- Точка входа ----------
 
 if __name__ == "__main__":
+    # Render пробрасывает PORT, если нет — используем 8000
     port = int(os.environ.get("PORT", "8000"))
-    # HTTP MCP endpoint будет доступен по адресу: http://0.0.0.0:PORT/mcp
+
+    # MCP по HTTP: /mcp
     mcp.run(
         transport="http",
         host="0.0.0.0",
