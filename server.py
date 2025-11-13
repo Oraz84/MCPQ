@@ -211,11 +211,10 @@ def search_documents(
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
 
-    # FastMCP HTTP server (правильный)
     mcp.run_http(
         host="0.0.0.0",
         port=port,
-        path="/mcp"
+        path="/mcp",
     )
 
 
