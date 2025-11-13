@@ -208,8 +208,15 @@ def search_documents(
 
 
 # ---------- Точка входа ----------
-
 if __name__ == "__main__":
-    # Для твоей версии fastmcp — просто включаем HTTP-транспорт,
-    # без host/port (они и дают TypeError).
-    mcp.run(transport="http")
+    # Render пробрасывает порт в переменную PORT
+    port = int(os.environ.get("PORT", "8000"))
+
+    # HTTP MCP endpoint будет: https://...onrender.com/mcp
+    mcp.run(
+        transport="http",
+        host="0.0.0.0",
+        port=port,
+        path="/mcp",
+    )
+
