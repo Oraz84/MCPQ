@@ -9,11 +9,10 @@ from mcp.types import (
     InitializeResult,
     ToolsListResult,
     CallToolResult,
-    Error,
 )
 
-import httpx
 from openai import OpenAI
+import httpx
 
 
 QDRANT_URL = os.getenv("QDRANT_URL")
@@ -26,8 +25,6 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 server = Server("qdrant_rag")
 
-
-# ----------------- UTILITIES ----------------------------
 
 async def embed(text: str) -> List[float]:
     resp = openai_client.embeddings.create(
@@ -77,18 +74,13 @@ async def qdrant_search(vec: List[float], top_k: int = 5):
             headers=headers
         )
         r.raise_for_status()
-        data = r.json()
-        return data.get("result", [])
+        return r.json().get("result", [])
 
 
-# ----------------- MCP HANDLERS ----------------------------
-
+# ---------------- MCP ----------------
 
 @server.initializer()
 async def handle_initialize(req: InitializeRequest) -> InitializeResult:
-    """
-    ChatGPT calls this first. Must return session_id.
-    """
     return InitializeResult(
         protocolVersion="2024-02-01",
         capabilities={"tools": True},
@@ -130,29 +122,25 @@ async def handle_list_tools() -> ToolsListResult:
 
 
 @server.call_tool("store_document")
-async def handle_store_document(params: Dict[str, Any]) -> CallToolResult:
+async def store_document(params: Dict[str, Any]) -> CallToolResult:
     doc_id = params["doc_id"]
     text = params["text"]
     metadata = params.get("metadata", {})
-
     vector = await embed(text)
     await qdrant_upsert(doc_id, vector, {"text": text, "metadata": metadata})
-
     return CallToolResult(output=f"Stored document {doc_id}")
 
 
 @server.call_tool("search_documents")
-async def handle_search(params: Dict[str, Any]) -> CallToolResult:
+async def search_docs(params: Dict[str, Any]) -> CallToolResult:
     query = params["query"]
     top_k = params.get("top_k", 5)
-
     vec = await embed(query)
     hits = await qdrant_search(vec, top_k)
-
     return CallToolResult(output=json.dumps(hits, indent=2))
 
 
-# ----------------- SERVER START ----------------------------
+# ---------------- RUN HTTP MCP ----------------
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
