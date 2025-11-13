@@ -1,220 +1,159 @@
 import os
-from typing import Any, Dict, List, Optional
+import json
+import asyncio
+from typing import Dict, Any, List, Optional
+
+from mcp.server import Server
+from mcp.types import (
+    InitializeRequest,
+    InitializeResult,
+    ToolsListResult,
+    CallToolResult,
+    Error,
+)
 
 import httpx
-from fastmcp import FastMCP
 from openai import OpenAI
 
 
-# ---------- Конфигурация ----------
-
-MCP_SERVER_NAME = "qdrant_rag"
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-QDRANT_URL = os.getenv("QDRANT_URL")            # пример: https://xxx.eu-central-1-0.aws.cloud.qdrant.io
+QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "docs")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Инициализация FastMCP
-mcp = FastMCP(MCP_SERVER_NAME)
-
-
-# ---------- Вспомогательные функции ----------
-
-class ConfigError(Exception):
-    """Ошибка конфигурации MCP-сервера (нет env-переменных и т.п.)."""
-    pass
+server = Server("qdrant_rag")
 
 
-def ensure_config() -> None:
-    """Проверяем, что все нужные переменные окружения выставлены."""
-    missing = []
-    if not OPENAI_API_KEY:
-        missing.append("OPENAI_API_KEY")
-    if not QDRANT_URL:
-        missing.append("QDRANT_URL")
-    if not QDRANT_API_KEY:
-        missing.append("QDRANT_API_KEY")
+# ----------------- UTILITIES ----------------------------
 
-    if missing:
-        raise ConfigError(
-            f"Missing env vars: {', '.join(missing)}. "
-            f"Set them in Render Environment."
-        )
-
-
-def embed_text(text: str) -> List[float]:
-    """Синхронно получаем эмбеддинг текста через OpenAI Embeddings API."""
-    if not openai_client:
-        raise ConfigError("OPENAI_API_KEY is not set")
-
+async def embed(text: str) -> List[float]:
     resp = openai_client.embeddings.create(
-        model=EMBEDDING_MODEL,
-        input=text,
+        model=EMBED_MODEL,
+        input=text
     )
     return resp.data[0].embedding
 
 
-def qdrant_upsert(
-    doc_id: str,
-    vector: List[float],
-    payload: Dict[str, Any],
-) -> None:
-    """Создаём/обновляем точку в Qdrant."""
-    ensure_config()
-
+async def qdrant_upsert(doc_id: str, vector: List[float], payload: Dict[str, Any]):
     headers = {
         "Content-Type": "application/json",
-        "Api-Key": QDRANT_API_KEY,
+        "api-key": QDRANT_API_KEY
     }
 
-    body = {
-        "points": [
-            {
-                "id": doc_id,
-                "vector": vector,
-                "payload": payload,
-            }
-        ]
-    }
+    async with httpx.AsyncClient() as client:
+        r = await client.put(
+            f"{QDRANT_URL}/collections/{QDRANT_COLLECTION}/points",
+            json={
+                "points": [
+                    {
+                        "id": doc_id,
+                        "vector": vector,
+                        "payload": payload
+                    }
+                ]
+            },
+            headers=headers
+        )
+        r.raise_for_status()
 
-    base_url = QDRANT_URL.rstrip("/")
 
-    with httpx.Client(timeout=30.0) as client:
-        url = f"{base_url}/collections/{QDRANT_COLLECTION}/points"
-        resp = client.put(url, headers=headers, json=body)
-        resp.raise_for_status()
-
-
-def qdrant_search(
-    query_vector: List[float],
-    top_k: int = 5,
-) -> List[Dict[str, Any]]:
-    """Поиск по Qdrant по вектору."""
-    ensure_config()
-
+async def qdrant_search(vec: List[float], top_k: int = 5):
     headers = {
         "Content-Type": "application/json",
-        "Api-Key": QDRANT_API_KEY,
+        "api-key": QDRANT_API_KEY
     }
 
-    body = {
-        "vector": query_vector,
-        "limit": top_k,
-        "with_payload": True,
-        "with_vectors": False,
-    }
-
-    base_url = QDRANT_URL.rstrip("/")
-
-    with httpx.Client(timeout=30.0) as client:
-        url = f"{base_url}/collections/{QDRANT_COLLECTION}/points/search"
-        resp = client.post(url, headers=headers, json=body)
-        resp.raise_for_status()
-        data = resp.json()
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"{QDRANT_URL}/collections/{QDRANT_COLLECTION}/points/search",
+            json={
+                "vector": vec,
+                "with_payload": True,
+                "limit": top_k
+            },
+            headers=headers
+        )
+        r.raise_for_status()
+        data = r.json()
         return data.get("result", [])
 
 
-# ---------- MCP tools ----------
+# ----------------- MCP HANDLERS ----------------------------
 
-@mcp.tool()
-def ping() -> str:
+
+@server.initializer()
+async def handle_initialize(req: InitializeRequest) -> InitializeResult:
     """
-    Healthcheck MCP-сервера.
-
-    Возвращает "pong", если сервер жив и конфиг валиден.
+    ChatGPT calls this first. Must return session_id.
     """
-    ensure_config()
-    return "pong"
-
-
-@mcp.tool()
-def store_document(
-    doc_id: str,
-    text: str,
-    metadata: Optional[Dict[str, Any]] = None,
-) -> str:
-    """
-    Сохранить текст документа в Qdrant с эмбеддингом.
-
-    Args:
-        doc_id: Уникальный ID документа.
-        text: Содержимое документа.
-        metadata: Доп. метаданные (любой JSON-объект).
-
-    Returns:
-        Статус-строка об успешной операции или ошибке.
-    """
-    try:
-        ensure_config()
-        vector = embed_text(text)
-        payload: Dict[str, Any] = {"text": text}
-        if metadata:
-            payload["metadata"] = metadata
-
-        qdrant_upsert(doc_id, vector, payload)
-        return f"Document {doc_id} stored successfully in collection '{QDRANT_COLLECTION}'."
-    except Exception as e:
-        return f"Error in store_document: {e!r}"
-
-
-@mcp.tool()
-def search_documents(
-    query: str,
-    top_k: int = 5,
-) -> List[Dict[str, Any]]:
-    """
-    Поиск по документам в Qdrant.
-
-    Args:
-        query: Текстовый запрос пользователя.
-        top_k: Количество результатов (по умолчанию 5).
-
-    Returns:
-        Список найденных документов:
-        [
-          {
-            "id": ...,
-            "score": ...,
-            "text": ...,
-            "metadata": {...}
-          },
-          ...
-        ]
-        либо один элемент с ключом "error" при ошибке.
-    """
-    try:
-        ensure_config()
-        query_vector = embed_text(query)
-        hits = qdrant_search(query_vector, top_k=top_k)
-
-        results: List[Dict[str, Any]] = []
-        for hit in hits:
-            payload = hit.get("payload") or {}
-            results.append(
-                {
-                    "id": hit.get("id"),
-                    "score": hit.get("score"),
-                    "text": payload.get("text"),
-                    "metadata": payload.get("metadata"),
-                }
-            )
-        return results
-    except Exception as e:
-        return [{"error": repr(e)}]
-
-
-# ---------- Точка входа ----------
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8000"))
-
-    mcp.run_http(
-        host="0.0.0.0",
-        port=port,
-        path="/mcp",
+    return InitializeResult(
+        protocolVersion="2024-02-01",
+        capabilities={"tools": True},
+        sessionId="session-1"
     )
 
 
+@server.list_tools()
+async def handle_list_tools() -> ToolsListResult:
+    return ToolsListResult(
+        tools=[
+            {
+                "name": "store_document",
+                "description": "Store document in Qdrant.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "doc_id": {"type": "string"},
+                        "text": {"type": "string"},
+                        "metadata": {"type": "object"}
+                    },
+                    "required": ["doc_id", "text"]
+                }
+            },
+            {
+                "name": "search_documents",
+                "description": "Search documents in Qdrant.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "top_k": {"type": "number"}
+                    },
+                    "required": ["query"]
+                }
+            }
+        ]
+    )
+
+
+@server.call_tool("store_document")
+async def handle_store_document(params: Dict[str, Any]) -> CallToolResult:
+    doc_id = params["doc_id"]
+    text = params["text"]
+    metadata = params.get("metadata", {})
+
+    vector = await embed(text)
+    await qdrant_upsert(doc_id, vector, {"text": text, "metadata": metadata})
+
+    return CallToolResult(output=f"Stored document {doc_id}")
+
+
+@server.call_tool("search_documents")
+async def handle_search(params: Dict[str, Any]) -> CallToolResult:
+    query = params["query"]
+    top_k = params.get("top_k", 5)
+
+    vec = await embed(query)
+    hits = await qdrant_search(vec, top_k)
+
+    return CallToolResult(output=json.dumps(hits, indent=2))
+
+
+# ----------------- SERVER START ----------------------------
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    server.run_http("0.0.0.0", port, path="/mcp")
