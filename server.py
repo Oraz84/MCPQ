@@ -18,10 +18,11 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
+# Инициализация FastMCP
 mcp = FastMCP(MCP_SERVER_NAME)
 
 
-# ---------- Вспомогательные штуки ----------
+# ---------- Вспомогательные функции ----------
 
 class ConfigError(Exception):
     """Ошибка конфигурации MCP-сервера (нет env-переменных и т.п.)."""
@@ -80,7 +81,6 @@ def qdrant_upsert(
         ]
     }
 
-    # Убедимся, что нет двойного слэша
     base_url = QDRANT_URL.rstrip("/")
 
     with httpx.Client(timeout=30.0) as client:
@@ -123,9 +123,9 @@ def qdrant_search(
 @mcp.tool()
 def ping() -> str:
     """
-    Простой healthcheck MCP-сервера.
+    Healthcheck MCP-сервера.
 
-    Возвращает "pong", если сервер жив и конфигурация валидна.
+    Возвращает "pong", если сервер жив и конфиг валиден.
     """
     ensure_config()
     return "pong"
@@ -210,13 +210,6 @@ def search_documents(
 # ---------- Точка входа ----------
 
 if __name__ == "__main__":
-    # Render пробрасывает PORT, если нет — используем 8000
-    port = int(os.environ.get("PORT", "8000"))
-
-    # MCP по HTTP: /mcp
-    mcp.run(
-        transport="http",
-        host="0.0.0.0",
-        port=port,
-        path="/mcp",
-    )
+    # Для твоей версии fastmcp — просто включаем HTTP-транспорт,
+    # без host/port (они и дают TypeError).
+    mcp.run(transport="http")
