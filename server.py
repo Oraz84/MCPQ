@@ -209,14 +209,13 @@ def search_documents(
 
 # ---------- Точка входа ----------
 if __name__ == "__main__":
-    # Render пробрасывает порт в переменную PORT
     port = int(os.environ.get("PORT", "8000"))
 
-    # HTTP MCP endpoint будет: https://...onrender.com/mcp
-    mcp.run(
-        transport="http",
+    # FastMCP HTTP server (правильный)
+    mcp.run_http(
         host="0.0.0.0",
         port=port,
-        path="/mcp",
+        path="/mcp"
     )
+
 
