@@ -1,5 +1,4 @@
 import asyncio
-import json
 from mcp.server import Server
 from mcp.types import (
     ListToolsResult,
@@ -7,7 +6,6 @@ from mcp.types import (
     CallToolResult,
     ListPromptsResult,
     Prompt,
-    Error,
 )
 from openai import AsyncOpenAI
 
@@ -22,9 +20,15 @@ async def list_tools() -> ListToolsResult:
         tools=[
             Tool(
                 name="ask_gpt",
-                description="Отправляет запрос в OpenAI GPT-модель и возвращает ответ.",
-                inputSchema={"type": "object", "properties": {"query": {"type": "string"}}},
-            ),
+                description="Отправляет текст в модель GPT и возвращает ответ.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"}
+                    },
+                    "required": ["query"]
+                },
+            )
         ]
     )
 
@@ -43,7 +47,9 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
             content=[{"type": "text", "text": completion.output_text}]
         )
 
-    return Error(message=f"Неизвестный инструмент: {name}")
+    return CallToolResult(
+        content=[{"type": "text", "text": f"Неизвестный инструмент: {name}"}]
+    )
 
 
 @server.list_prompts()
@@ -52,7 +58,7 @@ async def list_prompts() -> ListPromptsResult:
         prompts=[
             Prompt(
                 name="hello",
-                description="Пример встроенного промпта",
+                description="Пример MCP-промпта",
                 arguments=[],
             )
         ]
@@ -64,14 +70,20 @@ async def get_prompt(name: str):
     if name == "hello":
         return {
             "content": [
-                {"type": "text", "text": "Привет! Это пример MCP-промпта."}
+                {"type": "text", "text": "Привет! Это пример MCP промпта."}
             ]
         }
-    raise ValueError("Промпт не найден")
+
+    return {
+        "content": [
+            {"type": "text", "text": "Промпт не найден."}
+        ]
+    }
 
 
 async def main():
     await server.run()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
