@@ -3,10 +3,7 @@ import json
 from typing import Dict, Any, List
 
 from mcp.server import Server
-from mcp.types import (
-    InitializeResult,
-    Error,
-)
+from mcp.types import InitializeResult
 
 import httpx
 from qdrant_client import QdrantClient
@@ -33,6 +30,7 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
 server = Server("fh_mcp")
 
+
 def get_gdrive_service():
     creds_info = json.loads(GOOGLE_CREDS_JSON)
     creds = google.oauth2.service_account.Credentials.from_service_account_info(
@@ -40,6 +38,7 @@ def get_gdrive_service():
         scopes=["https://www.googleapis.com/auth/drive.readonly"]
     )
     return build("drive", "v3", credentials=creds)
+
 
 def extract_text_from_file(file_bytes: bytes, mime_type: str):
     if mime_type == "application/pdf":
@@ -52,6 +51,7 @@ def extract_text_from_file(file_bytes: bytes, mime_type: str):
         return file_bytes.decode("utf-8", errors="ignore")
     return ""
 
+
 qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 
 if not qdrant.collection_exists(QDRANT_COLLECTION):
@@ -63,6 +63,7 @@ if not qdrant.collection_exists(QDRANT_COLLECTION):
         )
     )
 
+
 async def get_embedding(text: str) -> List[float]:
     async with httpx.AsyncClient() as client:
         r = await client.post(
@@ -73,6 +74,7 @@ async def get_embedding(text: str) -> List[float]:
         j = r.json()
         return j["data"][0]["embedding"]
 
+
 @server.on("initialize")
 async def on_initialize(request, response):
     return InitializeResult(
@@ -80,6 +82,7 @@ async def on_initialize(request, response):
         capabilities={"tools": True},
         sessionId="fh-session"
     )
+
 
 @server.on("tools/list")
 async def on_tools_list(request, response):
@@ -126,6 +129,7 @@ async def on_tools_list(request, response):
             }
         ]
     }
+
 
 @server.on("tools/call")
 async def on_tools_call(request, response):
@@ -195,7 +199,14 @@ async def on_tools_call(request, response):
             ]
         }
 
-    return Error(code=-1, message=f"Unknown tool: {tool}")
+    # NEW: correct MCP-style error response
+    return {
+        "error": {
+            "code": -1,
+            "message": f"Unknown tool: {tool}"
+        }
+    }
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
