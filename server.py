@@ -3,7 +3,10 @@ import json
 from typing import Dict, Any, List
 
 from mcp.server import Server
-from mcp.types import InitializeRequest
+from mcp.types import (
+    InitializeResult,
+    Error,
+)
 
 import httpx
 from qdrant_client import QdrantClient
@@ -26,6 +29,7 @@ GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 QDRANT_URL = os.environ.get("QDRANT_URL", "")
 QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY", "")
 QDRANT_COLLECTION = "rag_docs"
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
 server = Server("fh_mcp")
 
@@ -35,14 +39,12 @@ def get_gdrive_service():
         creds_info,
         scopes=["https://www.googleapis.com/auth/drive.readonly"]
     )
-    service = build("drive", "v3", credentials=creds)
-    return service
+    return build("drive", "v3", credentials=creds)
 
 def extract_text_from_file(file_bytes: bytes, mime_type: str):
     if mime_type == "application/pdf":
         reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
-        text = "\n".join(page.extract_text() or "" for page in reader.pages)
-        return text
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
     if mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
         doc = docx.Document(io.BytesIO(file_bytes))
         return "\n".join(p.text for p in doc.paragraphs)
@@ -50,15 +52,10 @@ def extract_text_from_file(file_bytes: bytes, mime_type: str):
         return file_bytes.decode("utf-8", errors="ignore")
     return ""
 
-qdrant = QdrantClient(
-    url=QDRANT_URL,
-    api_key=QDRANT_API_KEY,
-)
+qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 
-try:
-    qdrant.get_collection(QDRANT_COLLECTION)
-except:
-    qdrant.recreate_collection(
+if not qdrant.collection_exists(QDRANT_COLLECTION):
+    qdrant.create_collection(
         collection_name=QDRANT_COLLECTION,
         vectors_config=VectorParams(
             size=1536,
@@ -66,36 +63,31 @@ except:
         )
     )
 
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-
 async def get_embedding(text: str) -> List[float]:
     async with httpx.AsyncClient() as client:
         r = await client.post(
             "https://api.openai.com/v1/embeddings",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-            json={
-                "model": "text-embedding-3-small",
-                "input": text
-            }
+            json={"model": "text-embedding-3-small", "input": text}
         )
-        data = r.json()
-        return data["data"][0]["embedding"]
+        j = r.json()
+        return j["data"][0]["embedding"]
 
-@server.initializer()
-async def handle_initialize(req: InitializeRequest):
-    return {
-        "protocolVersion": "2024-02-01",
-        "capabilities": {"tools": True},
-        "sessionId": "fh-session"
-    }
+@server.on("initialize")
+async def on_initialize(request, response):
+    return InitializeResult(
+        protocolVersion="2024-02-01",
+        capabilities={"tools": True},
+        sessionId="fh-session"
+    )
 
-@server.list_tools()
-async def list_tools():
+@server.on("tools/list")
+async def on_tools_list(request, response):
     return {
         "tools": [
             {
                 "name": "gdrive_search",
-                "description": "Search Google Drive folder for files",
+                "description": "Search files in Google Drive folder",
                 "inputSchema": {
                     "type": "object",
                     "properties": {"query": {"type": "string"}},
@@ -112,15 +104,6 @@ async def list_tools():
                 }
             },
             {
-                "name": "rag_search",
-                "description": "Search Qdrant RAG",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {"query": {"type": "string"}},
-                    "required": ["query"]
-                }
-            },
-            {
                 "name": "rag_upsert",
                 "description": "Add document text to Qdrant RAG",
                 "inputSchema": {
@@ -131,76 +114,88 @@ async def list_tools():
                     },
                     "required": ["doc_id", "text"]
                 }
+            },
+            {
+                "name": "rag_search",
+                "description": "Search Qdrant RAG",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }
             }
         ]
     }
 
-@server.call_tool("gdrive_search")
-async def gdrive_search(params):
-    query = params["query"]
-    service = get_gdrive_service()
-    response = service.files().list(
-        q=f"'{GDRIVE_FOLDER_ID}' in parents and trashed = false and name contains '{query}'",
-        fields="files(id, name, mimeType)"
-    ).execute()
-    return {"files": response.get("files", [])}
+@server.on("tools/call")
+async def on_tools_call(request, response):
+    tool = request.params["name"]
+    args = request.params.get("arguments", {})
 
-@server.call_tool("gdrive_read")
-async def gdrive_read(params):
-    file_id = params["file_id"]
-    service = get_gdrive_service()
-    meta = service.files().get(fileId=file_id, fields="id, name, mimeType").execute()
-    mime = meta["mimeType"]
+    if tool == "gdrive_search":
+        query = args["query"]
+        service = get_gdrive_service()
+        res = service.files().list(
+            q=f"'{GDRIVE_FOLDER_ID}' in parents and trashed=false and name contains '{query}'",
+            fields="files(id, name, mimeType)"
+        ).execute()
+        return {"files": res.get("files", [])}
 
-    if mime.startswith("application/vnd.google-apps"):
-        export_mime = "application/pdf"
-        request = service.files().export_media(fileId=file_id, mimeType=export_mime)
-    else:
-        request = service.files().get_media(fileId=file_id)
+    if tool == "gdrive_read":
+        file_id = args["file_id"]
+        service = get_gdrive_service()
+        meta = service.files().get(fileId=file_id, fields="id,name,mimeType").execute()
+        mime = meta["mimeType"]
 
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
+        if mime.startswith("application/vnd.google-apps"):
+            req = service.files().export_media(fileId=file_id, mimeType="application/pdf")
+        else:
+            req = service.files().get_media(fileId=file_id)
 
-    text = extract_text_from_file(fh.getvalue(), mime)
-    return {"text": text}
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, req)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
 
-@server.call_tool("rag_upsert")
-async def rag_upsert(params):
-    doc_id = params["doc_id"]
-    text = params["text"]
-    emb = await get_embedding(text)
-    qdrant.upsert(
-        collection_name=QDRANT_COLLECTION,
-        points=[
-            PointStruct(
-                id=doc_id,
-                vector=emb,
-                payload={"text": text}
-            )
-        ]
-    )
-    return {"status": "ok"}
+        text = extract_text_from_file(fh.getvalue(), mime)
+        return {"text": text}
 
-@server.call_tool("rag_search")
-async def rag_search(params):
-    query = params["query"]
-    emb = await get_embedding(query)
-    hits = qdrant.search(
-        collection_name=QDRANT_COLLECTION,
-        query_vector=emb,
-        limit=5
-    )
-    return {
-        "results": [
-            {
-                "score": h.score,
-                "text": h.payload.get("text", "")
-            } for h in hits
-        ]
-    }
+    if tool == "rag_upsert":
+        doc_id = args["doc_id"]
+        text = args["text"]
+        emb = await get_embedding(text)
+        qdrant.upsert(
+            collection_name=QDRANT_COLLECTION,
+            points=[
+                PointStruct(
+                    id=doc_id,
+                    vector=emb,
+                    payload={"text": text}
+                )
+            ]
+        )
+        return {"status": "ok"}
+
+    if tool == "rag_search":
+        query = args["query"]
+        emb = await get_embedding(query)
+        hits = qdrant.search(
+            collection_name=QDRANT_COLLECTION,
+            query_vector=emb,
+            limit=5
+        )
+        return {
+            "results": [
+                {
+                    "score": h.score,
+                    "text": h.payload.get("text", "")
+                }
+                for h in hits
+            ]
+        }
+
+    return Error(code=-1, message=f"Unknown tool: {tool}")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
